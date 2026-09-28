@@ -1,0 +1,16 @@
+# Secrets
+terraform.tfvars
+*.tfvars
+!terraform.tfvars.example
+*.pem
+*.key
+*.pub
+
+# State
+*.tfstate
+*.tfstate.*
+.terraform/
+
+# Other
+crash.log
+*.slow-working-backup

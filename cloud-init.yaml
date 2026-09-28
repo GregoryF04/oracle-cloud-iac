@@ -1,0 +1,318 @@
+#cloud-config
+
+write_files:
+
+  # ============================================================
+  # Host statistics script
+  # ============================================================
+
+  - path: /home/opc/host-stats.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+
+      STATE_FILE="/home/opc/.host-stats-prev"
+
+      read -r _ USER NICE SYSTEM IDLE IOWAIT IRQ SOFTIRQ STEAL GUEST GUEST_NICE < <(grep '^cpu ' /proc/stat)
+
+      CURR_TOTAL=$((USER + NICE + SYSTEM + IDLE + IOWAIT + IRQ + SOFTIRQ + STEAL))
+      CURR_STEAL=$STEAL
+
+      if [ -f "$STATE_FILE" ]; then
+        read -r PREV_TOTAL PREV_STEAL < "$STATE_FILE"
+      else
+        PREV_TOTAL=$CURR_TOTAL
+        PREV_STEAL=$CURR_STEAL
+      fi
+
+      echo "$CURR_TOTAL $CURR_STEAL" > "$STATE_FILE"
+
+      DELTA_TOTAL=$((CURR_TOTAL - PREV_TOTAL))
+      DELTA_STEAL=$((CURR_STEAL - PREV_STEAL))
+
+      STEAL_PCT=$(awk \
+        -v s="$DELTA_STEAL" \
+        -v t="$DELTA_TOTAL" \
+        'BEGIN {
+          printf "%.1f", (t > 0) ? (s/t)*100 : 0
+        }')
+
+      LOAD=$(awk '{print $1, $2, $3}' /proc/loadavg)
+
+      MEM_TOTAL=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
+      MEM_AVAILABLE=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
+
+      SWAP_TOTAL=$(awk '/SwapTotal/ {print $2}' /proc/meminfo)
+      SWAP_FREE=$(awk '/SwapFree/ {print $2}' /proc/meminfo)
+
+      DISK_INFO=$(df -h / | awk 'NR==2 {print $2, $3, $4, $5}')
+
+      UPTIME_SECONDS=$(awk '{print int($1)}' /proc/uptime)
+
+      cat > /home/opc/host-stats.json <<EOF
+      {
+        "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+        "cpuStealPercent": $STEAL_PCT,
+        "loadAverage": "$LOAD",
+        "memory": {
+          "totalKB": $MEM_TOTAL,
+          "availableKB": $MEM_AVAILABLE
+        },
+        "swap": {
+          "totalKB": $SWAP_TOTAL,
+          "freeKB": $SWAP_FREE
+        },
+        "disk": "$DISK_INFO",
+        "hostUptimeSeconds": $UPTIME_SECONDS
+      }
+      EOF
+
+
+  # ============================================================
+  # Cron configuration for opc
+  # ============================================================
+
+  - path: /home/opc/opc-crontab
+    permissions: '0644'
+    content: |
+      */15 * * * * /usr/bin/sudo /usr/bin/docker stats --no-stream >> /home/opc/docker-stats.log 2>&1 && /usr/bin/tail -n 1000 /home/opc/docker-stats.log > /home/opc/docker-stats.log.tmp && /usr/bin/mv /home/opc/docker-stats.log.tmp /home/opc/docker-stats.log
+      * * * * * /home/opc/host-stats.sh
+
+
+  # ============================================================
+  # Allow opc to execute Docker through sudo without password
+  # ============================================================
+
+  - path: /etc/sudoers.d/opc-docker
+    owner: root:root
+    permissions: '0440'
+    content: |
+      opc ALL=(root) NOPASSWD: /usr/bin/docker
+
+
+  # ============================================================
+  # nginx reverse proxy config
+  # ============================================================
+
+  - path: /etc/nginx/conf.d/gameoflife.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      server {
+          listen 80;
+          server_name games.gregorydump.download;
+
+          location / {
+              proxy_pass http://127.0.0.1:8080;
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+          }
+      }
+
+
+runcmd:
+
+  # ============================================================
+  # Fix ownership/permissions of files created by write_files
+  # ============================================================
+
+  - chown opc:opc /home/opc/host-stats.sh
+  - chown opc:opc /home/opc/opc-crontab
+  - chmod 0755 /home/opc/host-stats.sh
+  - chmod 0644 /home/opc/opc-crontab
+
+
+  # ============================================================
+  # /home/opc permissions
+  # ============================================================
+
+  - chown opc:opc /home/opc
+  - chmod 0755 /home/opc
+
+
+  # ============================================================
+  # Wait for network/DNS
+  # ============================================================
+
+  - echo "nameserver 8.8.8.8" > /etc/resolv.conf
+  - echo "nameserver 1.1.1.1" >> /etc/resolv.conf
+  - until getent hosts github.com; do sleep 2; done
+
+
+  # ============================================================
+  # Swap
+  # ============================================================
+
+  - |
+    if ! swapon --show | grep -q '/swapfile'; then
+      if [ ! -f /swapfile ]; then
+        fallocate -l 5G /swapfile
+        chmod 600 /swapfile
+        mkswap /swapfile
+      fi
+
+      swapon /swapfile
+    fi
+
+  - |
+    if ! grep -q '^/swapfile ' /etc/fstab; then
+      echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    fi
+
+
+  # ============================================================
+  # Packages
+  # ============================================================
+
+  - dnf install -y dnf-utils git
+
+
+  # ============================================================
+  # EPEL (needed for certbot)
+  # ============================================================
+
+  - dnf config-manager --set-enabled ol9_developer_EPEL
+
+
+  # ============================================================
+  # Docker repository
+  # ============================================================
+
+  - dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+  - sed -i 's/\$releasever/9/g' /etc/yum.repos.d/docker-ce.repo
+
+
+  # ============================================================
+  # Docker
+  # ============================================================
+
+  - dnf install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+  - systemctl enable --now docker
+
+
+  # ============================================================
+  # nginx + certbot
+  # ============================================================
+
+  - dnf install -y nginx certbot python3-certbot-nginx
+  - systemctl enable --now nginx
+
+
+  # ============================================================
+  # Docker access for opc
+  # ============================================================
+
+  - usermod -aG docker opc
+
+
+  # ============================================================
+  # Validate sudoers configuration
+  # ============================================================
+
+  - visudo -cf /etc/sudoers.d/opc-docker
+
+
+  # ============================================================
+  # Firewall
+  # ============================================================
+
+  - firewall-cmd --add-port=80/tcp --permanent
+  - firewall-cmd --permanent --add-service=https
+  - firewall-cmd --reload
+
+
+  # ============================================================
+  # SELinux — allow nginx to proxy to localhost:8080
+  # ============================================================
+
+  - setsebool -P httpd_can_network_connect 1
+
+
+  # ============================================================
+  # Application directories
+  # ============================================================
+
+  - install -d -o opc -g opc -m 0755 /home/opc/gol-data
+
+  - touch /home/opc/docker-stats.log
+  - chown opc:opc /home/opc/docker-stats.log
+  - chmod 0644 /home/opc/docker-stats.log
+
+
+  # ============================================================
+  # Validate write_files
+  # ============================================================
+
+  - test -f /home/opc/host-stats.sh
+  - test -x /home/opc/host-stats.sh
+  - test -f /home/opc/opc-crontab
+
+
+  # ============================================================
+  # Initial host statistics
+  # ============================================================
+
+  - sudo -u opc /home/opc/host-stats.sh
+
+
+  # ============================================================
+  # Install cron for opc
+  # ============================================================
+
+  - crontab -u opc /home/opc/opc-crontab
+
+
+  # ============================================================
+  # Clone repository
+  # ============================================================
+
+  - |
+    if [ ! -d /home/opc/game-of-life/.git ]; then
+      sudo -u opc git clone \
+        https://github.com/GregoryF04/game-of-life \
+        /home/opc/game-of-life
+    fi
+
+
+  # ============================================================
+  # Correct repository ownership
+  # ============================================================
+
+  - chown -R opc:opc /home/opc/game-of-life
+
+
+  # ============================================================
+  # Start application
+  # ============================================================
+
+  - |
+    cd /home/opc/game-of-life
+    docker compose up -d --build
+
+
+  # ============================================================
+  # nginx config check + reload (picks up gameoflife.conf)
+  # ============================================================
+
+  - nginx -t
+  - systemctl reload nginx
+
+
+  # ============================================================
+  # Diagnostics
+  # ============================================================
+
+  - docker ps
+  - ls -lah /home/opc
+  - ls -l /home/opc/host-stats.sh
+  - ls -l /home/opc/opc-crontab
+  - ls -l /home/opc/host-stats.json
+  - crontab -u opc -l
+  - nginx -t
+
+  # ============================================================
+  # Certbot command (run manually after DNS propagation)
+  # sudo certbot --nginx -d games.gregorydump.download --non-interactive --agree-tos -m gregoryfendik04@gmail.com --redirect
+  # ============================================================
